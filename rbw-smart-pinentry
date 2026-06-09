@@ -1,0 +1,264 @@
+#!/bin/bash
+# rbw-smart-pinentry - Assuan-compliant dynamic rbw unlock helper.
+
+RP_ID="rbw.local"
+HMAC_SALT="rbw-service-account-salt-32bytes"
+FALLBACK_PROFILE="fallback"
+FALLBACK_ITEM="rbw vaultwarden"
+LOG_FILE="/tmp/rbw-debug.log"
+
+ASSUAN_ERR_CANCELLED="ERR 83886179 Cancelled"
+ASSUAN_ERR_FAILED="ERR 83886179 Unlock failed"
+ASSUAN_ERR_INVALID="ERR 83886095 Invalid password"
+
+log() {
+    echo "$(date '+%H:%M:%S') - $1" >> "$LOG_FILE"
+}
+
+notify() {
+    local message="$1"
+    local urgency="${2:-normal}"
+
+    command -v notify-send >/dev/null 2>&1 || return 0
+    notify-send "RBW Unlock" "$message" -u "$urgency" -t 3000
+}
+
+ok() {
+    echo "OK"
+}
+
+fail() {
+    local assuan_error="$1"
+    local notification="$2"
+    local urgency="${3:-critical}"
+
+    [ -n "$notification" ] && notify "$notification" "$urgency"
+    echo "$assuan_error"
+}
+
+send_secret() {
+    echo "D $1"
+    ok
+}
+
+require_commands() {
+    local cmd
+
+    for cmd in "$@"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            log "Missing required command: $cmd"
+            fail "$ASSUAN_ERR_FAILED" "Unlock failed. Missing command: $cmd"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+first_fido_device() {
+    fido2-token -L | head -n 1 | awk '{print $1}' | tr -d ':'
+}
+
+write_assert_file() {
+    local file="$1"
+
+    {
+        head -c 32 /dev/urandom | base64 -w 0
+        echo
+        echo "$RP_ID"
+        echo -n "$HMAC_SALT" | base64 -w 0
+        echo
+    } > "$file"
+}
+
+extract_secret() {
+    printf '%s\n' "$1" | tr -d '\r' | grep -E '^[A-Za-z0-9+/=]+$' | tail -n 1
+}
+
+prompt_fido_pin() {
+    {
+        echo "SETTITLE Token2 Hardware Unlock"
+        echo "SETDESC Enter your FIDO2 PIN. Touch the key when it flashes."
+        echo "GETPIN"
+        echo "BYE"
+    } | pinentry | sed -n 's/^D //p' | tail -n 1
+}
+
+run_fido_assertion() {
+    local device="$1"
+    local assert_file="$2"
+    local pin="$3"
+
+    FIDO_PIN="$pin" expect -c "
+        set timeout -1
+        spawn -noecho fido2-assert -G -r -v -h -i \"$assert_file\" \"$device\"
+        expect {
+            \"*PIN*\" {
+                send \"\$env(FIDO_PIN)\r\"
+                catch {exec notify-send \"RBW Unlock\" \"Touch your hardware key now.\" -u critical -t 5000}
+            }
+            eof
+        }
+        expect eof
+        set wait_result [wait]
+        exit [lindex \$wait_result 3]
+    " 2>&1
+}
+
+handle_fido_error() {
+    local output="$1"
+    local rc="$2"
+
+    log "FIDO2 assertion failed with exit $rc: $output"
+
+    if echo "$output" | grep -q "FIDO_ERR_PIN"; then
+        fail "$ASSUAN_ERR_INVALID" "Unlock failed. FIDO2 PIN was rejected or required."
+    elif echo "$output" | grep -q "FIDO_ERR_NO_CREDENTIALS"; then
+        fail "$ASSUAN_ERR_INVALID" "Unlock failed. No rbw credential found on token."
+    elif echo "$output" | grep -q "FIDO_ERR_ACTION_TIMEOUT"; then
+        fail "$ASSUAN_ERR_CANCELLED" "Unlock failed. Hardware key touch timed out."
+    else
+        fail "$ASSUAN_ERR_FAILED" "Unlock failed. FIDO2 assertion error."
+    fi
+}
+
+handle_fido_unlock() {
+    local device="$1"
+    local pin
+    local tmp_dir
+    local output
+    local rc
+    local secret
+
+    require_commands pinentry expect fido2-assert || return
+
+    log "Token detected: $device. Prompting for hardware PIN."
+    notify "Hardware key detected. Enter your FIDO2 PIN." "critical"
+
+    pin=$(prompt_fido_pin)
+    if [ -z "$pin" ]; then
+        log "User cancelled FIDO2 PIN entry."
+        fail "$ASSUAN_ERR_CANCELLED"
+        return
+    fi
+
+    tmp_dir=$(mktemp -d) || {
+        log "Failed to create temporary assertion directory."
+        fail "$ASSUAN_ERR_FAILED" "Unlock failed. Could not create temp directory."
+        return
+    }
+
+    write_assert_file "$tmp_dir/assert.txt"
+
+    log "Requesting FIDO2 hmac-secret assertion. Waiting for touch after PIN."
+    output=$(run_fido_assertion "$device" "$tmp_dir/assert.txt" "$pin")
+    rc=$?
+    rm -rf "$tmp_dir"
+
+    secret=$(extract_secret "$output")
+    if [ -n "$secret" ]; then
+        log "Successfully retrieved secret from FIDO2 token."
+        send_secret "$secret"
+    else
+        handle_fido_error "$output" "$rc"
+    fi
+}
+
+load_user_display_environment() {
+    [ -n "$WAYLAND_DISPLAY" ] && return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+
+    eval "$(systemctl --user show-environment | grep -E '^(WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DISPLAY)=')"
+}
+
+run_fallback_lookup() {
+    unset RBW_AGENT_PID
+    unset RBW_SOCKET_PATH
+    export RBW_PROFILE="$FALLBACK_PROFILE"
+
+    uwsm app -- rbw get "$FALLBACK_ITEM"
+    local get_rc=$?
+    rbw lock 2>/dev/null
+    rbw stop 2>/dev/null
+    return "$get_rc"
+}
+
+fallback_secret_from_output() {
+    printf '%s\n' "$1" | grep -v '^rbw: ' | tail -n 1
+}
+
+handle_fallback_error() {
+    local output="$1"
+    local rc="$2"
+
+    log "Fallback vault failed with exit $rc: $output"
+
+    if echo "$output" | grep -qiE "not found|no such|missing"; then
+        fail "$ASSUAN_ERR_INVALID" "Fallback vault item '$FALLBACK_ITEM' was not found."
+    elif echo "$output" | grep -qiE "unauthorized|forbidden|invalid|password|login"; then
+        fail "$ASSUAN_ERR_INVALID" "Fallback vault unlock failed. Check fallback password."
+    else
+        fail "$ASSUAN_ERR_INVALID" "Fallback vault unlock failed."
+    fi
+}
+
+handle_fallback_unlock() {
+    local output
+    local rc
+    local secret
+
+    require_commands rbw uwsm || return
+
+    log "No token detected. Using fallback vault profile."
+    notify "No token detected. Prompting for fallback password." "normal"
+    load_user_display_environment
+
+    output=$(run_fallback_lookup 2>&1)
+    rc=$?
+    secret=$(fallback_secret_from_output "$output")
+
+    if [ "$rc" -eq 0 ] && [ -n "$secret" ]; then
+        log "Successfully retrieved secret from fallback vault."
+        send_secret "$secret"
+    else
+        handle_fallback_error "$output" "$rc"
+    fi
+}
+
+handle_getpin() {
+    local device
+
+    log "GETPIN requested. Checking for FIDO2 token."
+    require_commands fido2-token || return
+
+    device=$(first_fido_device)
+    if [ -n "$device" ]; then
+        handle_fido_unlock "$device"
+    else
+        handle_fallback_unlock
+    fi
+}
+
+log "--- New pinentry session started ---"
+
+while read -r cmd; do
+    log "Received command: $cmd"
+
+    case "$cmd" in
+        OPTION*|\#*)
+            ok
+            ;;
+        GETPIN*)
+            handle_getpin
+            ;;
+        BYE*)
+            log "BYE command received. Exiting."
+            ok
+            exit 0
+            ;;
+        *)
+            log "Acknowledging setup command: $cmd"
+            ok
+            ;;
+    esac
+done
